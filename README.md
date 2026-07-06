@@ -1,0 +1,147 @@
+# RE-USE Fast Swift / MLX
+
+Native Swift implementation for running the RE-USE / SEMamba speech-enhancement model on Apple Silicon with a fused MLX/Metal selective-scan kernel.
+
+This package is meant for the `faraday/re-use-mlx` checkpoint, which contains `model_mlx.safetensors` converted for Apple Silicon / MLX / MLX Swift use. The code also accepts a direct `.safetensors` path.
+
+## Contents
+
+```text
+Package.swift
+Sources/
+  ReuseFastSwift/
+    SelectiveScan.swift   # fused Metal selective scan for SEMamba/Mamba
+    SEMamba.swift         # Swift MLX SEMamba architecture
+    ModelLoader.swift     # safetensors loading + key compatibility
+    STFT.swift            # RE-USE STFT/ISTFT + long-file OLA
+    Enhancer.swift        # waveform -> model -> waveform pipeline
+    WavIO.swift           # minimal WAV reader/writer
+  reuse-fast-cli/
+    main.swift            # CLI for inference and scan benchmark
+```
+
+## Requirements
+
+- Apple Silicon Mac
+- macOS 14+
+- Xcode command-line tools or Xcode
+- Swift 6.1+ compatible toolchain
+- Internet access on first build so SwiftPM can fetch `mlx-swift`
+
+## Download weights
+
+```bash
+pip install 'huggingface_hub[hf_xet]'
+huggingface-cli download --local-dir re-use-mlx faraday/re-use-mlx
+```
+
+The loader looks for either:
+
+```text
+re-use-mlx/model_mlx.safetensors
+re-use-mlx/model.safetensors
+/path/to/file.safetensors
+```
+
+## Build
+
+From this directory:
+
+```bash
+swift build -c release
+```
+
+If your local MLX Swift checkout requires Xcode's Metal build pipeline, use:
+
+```bash
+xcodebuild \
+  -scheme reuse-fast-cli \
+  -configuration Release \
+  -destination 'platform=macOS' \
+  -derivedDataPath .build/xcode \
+  build
+```
+
+## Run inference
+
+With SwiftPM build output:
+
+```bash
+.build/release/reuse-fast-cli \
+  --weights re-use-mlx \
+  --input noisy.wav \
+  --output clean.wav
+```
+
+With the Xcode build path:
+
+```bash
+.build/xcode/Build/Products/Release/reuse-fast-cli \
+  --weights re-use-mlx \
+  --input noisy.wav \
+  --output clean.wav
+```
+
+Useful flags:
+
+```bash
+--chunk-size-s 1.0       # long-file chunk size
+--hop-portion 0.5        # chunk overlap ratio
+--strict                 # strict parameter verification
+--print-checkpoint-keys  # inspect a checkpoint
+--print-model-keys       # inspect expected Swift model keys
+```
+
+## Benchmark only the fused selective scan
+
+```bash
+.build/release/reuse-fast-cli --benchmark-scan
+```
+
+RE-USE-like defaults are:
+
+```text
+u:      [82, 256, 51]
+A:      [256, 16]
+B, C:   [82, 16, 51]
+```
+
+You can override them:
+
+```bash
+.build/release/reuse-fast-cli \
+  --benchmark-scan \
+  --scan-batch 51 \
+  --scan-dim 256 \
+  --scan-length 82 \
+  --scan-dstate 16 \
+  --iterations 100
+```
+
+## What is fast here
+
+`SelectiveScan.swift` fuses the SEMamba/Mamba recurrence into one `MLXFast.metalKernel` dispatch. The kernel keeps the Mamba state vector in Metal thread registers and uses one GPU thread for each `(batch, dInner)` lane:
+
+```text
+u, delta, z: [B, dInner, L]
+A:           [dInner, dState]
+B, C:        [B, dState, L]
+D, bias:     [dInner]
+```
+
+For each time step:
+
+```text
+dt       = softplus(delta + delta_bias)
+state[n] = exp(dt * A[d,n]) * state[n] + dt * B[b,n,t] * u[b,d,t]
+y[t]     = (sum_n state[n] * C[b,n,t] + D[d] * u[b,d,t]) * silu(z[b,d,t])
+```
+
+That avoids the expensive pure-Swift or pure-MLX loop over sequence length and avoids materializing the large `deltaA` / `deltaB_u` intermediates.
+
+## Limitations
+
+- This targets MLX/Metal GPU execution, not the Apple Neural Engine.
+- The model code is keyed for the Faraday MLX/Swift safetensors naming convention and includes aliases for common Python/camelCase variants. If loading fails, run `--print-checkpoint-keys` and compare with `--print-model-keys`.
+- The WAV writer emits mono 32-bit IEEE float WAV.
+- The RE-USE license in the model card is non-commercial. Check it before using the model outside research/education.
