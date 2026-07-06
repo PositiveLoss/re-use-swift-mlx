@@ -150,16 +150,18 @@ func parseOptions(_ args: [String]) throws -> Options {
 }
 
 func printExpectedModelKeys() {
-    for key in ReuseModelLoader.modelParameterKeys() {
-        print(key)
+    let model = SEMamba()
+    for (key, param) in model.parameters().flattened().sorted(by: { $0.0 < $1.0 }) {
+        print("\(key) \(param.shape) \(param.dtype)")
     }
 }
 
 func printCheckpointKeys(weightsPath: String) throws {
     let url = try ReuseModelLoader.resolveWeights(URL(fileURLWithPath: weightsPath))
     let arrays = try loadArrays(url: url)
-    for key in arrays.keys.sorted() {
-        let value = arrays[key]!
+    let sanitized = ReuseModelLoader.sanitize(weights: arrays)
+    for key in sanitized.keys.sorted() {
+        let value = sanitized[key]!
         print("\(key) \(value.shape) \(value.dtype)")
     }
 }

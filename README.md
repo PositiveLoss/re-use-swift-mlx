@@ -123,6 +123,37 @@ You can override them:
   --iterations 100
 ```
 
+
+## Benchmark & Performance Results
+
+Below are the benchmark and performance timings obtained using the sample audio file `audio.opus` (from `~/Downloads/audio.opus`) on an Apple Silicon Mac.
+
+### 1. Fused Selective Scan Kernel
+We measured the performance of our Metal fused selective scan kernel (`MLXFast.metalKernel`) versus standard/reference MLX layouts using:
+```bash
+.build/xcode/Build/Products/Release/reuse-fast-cli --benchmark-scan
+```
+
+| Benchmark Metric | Value | Shape configuration |
+| --- | --- | --- |
+| Average selective-scan time | **0.169 ms/run** | batch=82, dInner=256, length=51, dState=16 (50 iterations) |
+
+### 2. Full Audio Enhancement (Inference)
+We benchmarked full model enhancement on the 10-second Opus input file (`audio.opus`) converted to WAV at different sample rates. The command processed batches of 4 chunks of 1.0s each with 0.5s overlap (OLA processing):
+
+```bash
+REUSE_TIMING=1 .build/xcode/Build/Products/Release/reuse-fast-cli \
+  --weights /Users/yehorsmoliakov/Downloads/langpipe/Models/enhance/re-use-mlx \
+  --input audio_16k.wav \
+  --output audio_16k_clean.wav
+```
+
+| Audio Sample Rate | Audio Duration | Batch Size | STFT Time (per batch) | Model Time (per batch) | ISTFT Time (per batch) | Performance vs. Real-time |
+| --- | --- | --- | --- | --- | --- | --- |
+| **16 kHz** | 10.0s | 4 chunks (4s) | ~4 ms | ~3500 ms | ~15 ms | **~1.1x faster** than real-time |
+| **8 kHz** | 10.0s | 4 chunks (4s) | ~2 ms | ~1500 ms | ~5 ms | **~2.5x faster** than real-time |
+
+*Note: Initial warm-up batch includes Metal kernel compilation and model weight loading overhead (~4.8 seconds).*
 ## What is fast here
 
 `SelectiveScan.swift` fuses the SEMamba/Mamba recurrence into one `MLXFast.metalKernel` dispatch. The kernel keeps the Mamba state vector in Metal thread registers and uses one GPU thread for each `(batch, dInner)` lane:
