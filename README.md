@@ -16,6 +16,8 @@ Sources/
     STFT.swift            # RE-USE STFT/ISTFT + long-file OLA
     Enhancer.swift        # waveform -> model -> waveform pipeline
     WavIO.swift           # minimal WAV reader/writer
+    DepthwiseConv.swift   # custom Metal depthwise causal 1D conv kernel
+    Profiler.swift        # helper utility for debugging module execution times
   reuse-fast-cli/
     main.swift            # CLI for inference and scan benchmark
 ```
@@ -87,9 +89,12 @@ Useful flags:
 ```bash
 --chunk-size-s 1.0       # long-file chunk size
 --hop-portion 0.5        # chunk overlap ratio
+--dtype bf16             # compute dtype: bf16 (default), fp32, or fp16
 --strict                 # strict parameter verification
 --print-checkpoint-keys  # inspect a checkpoint
 --print-model-keys       # inspect expected Swift model keys
+--verify-scan            # numerically verify fused scan kernel correctness
+--compare-scan           # compare speed of fused vs parallel scan
 ```
 
 ## Benchmark only the fused selective scan
@@ -98,12 +103,12 @@ Useful flags:
 .build/release/reuse-fast-cli --benchmark-scan
 ```
 
-RE-USE-like defaults are:
+RE-USE-like defaults (channels-last layout) are:
 
 ```text
-u:      [82, 256, 51]
-A:      [256, 16]
-B, C:   [82, 16, 51]
+u:      [82, 51, 256]   # [B, L, dInner]
+A:      [256, 16]       # [dInner, dState]
+B, C:   [82, 51, 16]    # [B, L, dState]
 ```
 
 You can override them:
@@ -123,9 +128,9 @@ You can override them:
 `SelectiveScan.swift` fuses the SEMamba/Mamba recurrence into one `MLXFast.metalKernel` dispatch. The kernel keeps the Mamba state vector in Metal thread registers and uses one GPU thread for each `(batch, dInner)` lane:
 
 ```text
-u, delta, z: [B, dInner, L]
+u, delta, z: [B, L, dInner]
 A:           [dInner, dState]
-B, C:        [B, dState, L]
+B, C:        [B, L, dState]
 D, bias:     [dInner]
 ```
 

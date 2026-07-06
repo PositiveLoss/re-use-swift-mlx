@@ -77,8 +77,17 @@ public final class REUSEEnhancer {
         hopPortion: Float = 0.5
     ) -> MLXArray {
         let wave2D = waveform.ndim == 1 ? expandedDimensions(waveform, axis: 0) : waveform
-        let out2D = enhanceChunk(wave2D, sampleRate: sampleRate)
+        let chunkSize = Int(Float(sampleRate) * chunkSizeSeconds)
+        let out2D = chunkedHannOLA(
+            wave: wave2D,
+            chunkSize: chunkSize,
+            hopPortion: hopPortion,
+            batchSize: 4
+        ) { [weak self] chunk in
+            guard let self = self else { return chunk }
+            return self.enhanceChunk(chunk, sampleRate: sampleRate)
+        }
         eval(out2D)
-        return out2D[0]
+        return out2D
     }
 }
