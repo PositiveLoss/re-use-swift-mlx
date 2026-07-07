@@ -608,7 +608,10 @@ public final class RealtimeStreamingSEMamba {
         ) {
             self.batchSize = batchSize
             self.freqBins = freqBins
-            let encoded = freqBins / 2 + 1
+            // The model appends two frequency bins before the stride-2 encoder conv:
+            // output width = floor(((freqBins + 2) + 2*pad - kernel) / 2) + 1
+            // with pad=1, kernel=3 -> floor((freqBins + 1) / 2) + 1.
+            let encoded = (freqBins + 1) / 2 + 1
             self.encodedFreqBins = encoded
             self.exitLayer = exitLayer
             self.lookAheadFrames = lookAheadFrames
