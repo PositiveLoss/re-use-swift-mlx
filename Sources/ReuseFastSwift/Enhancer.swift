@@ -91,3 +91,130 @@ public final class REUSEEnhancer {
         return out2D
     }
 }
+
+public final class RealtimeREUSEEnhancer {
+    public let model: RealtimeSEMamba
+    public let compressFactor: String
+
+    public init(model: RealtimeSEMamba, compressFactor: String = "relu_log1p") {
+        self.model = model
+        self.compressFactor = compressFactor
+    }
+
+    public func enhanceChunk(
+        _ chunk: MLXArray,
+        sampleRate: Int,
+        exitLayer: Int = 8,
+        lookAheadFrames: Int = 0
+    ) -> MLXArray {
+        let params = realtimeSTFTParams(for: sampleRate)
+        let (mag, pha) = magPhaseSTFT(
+            wave: chunk,
+            nFFT: params.nFFT,
+            hop: params.hop,
+            win: params.win,
+            compressFactor: compressFactor,
+            center: true,
+            addEps: false
+        )
+        let (amp, estPha, _) = model(
+            noisyMag: mag,
+            noisyPhase: pha,
+            exitLayer: exitLayer,
+            lookAheadFrames: lookAheadFrames
+        )
+        let filteredAmp = sweepArtifactFilter(amp)
+        let out = magPhaseISTFT(
+            mag: filteredAmp,
+            phase: estPha,
+            nFFT: params.nFFT,
+            hop: params.hop,
+            win: params.win,
+            compressFactor: compressFactor,
+            center: true
+        )
+        return clip(out, min: -1.0, max: 1.0)
+    }
+
+    public func enhance(
+        waveform: MLXArray,
+        sampleRate: Int,
+        chunkSizeSeconds: Float = 1.0,
+        hopPortion: Float = 0.5,
+        exitLayer: Int = 8,
+        lookAheadFrames: Int = 0
+    ) -> MLXArray {
+        let wave2D = waveform.ndim == 1 ? expandedDimensions(waveform, axis: 0) : waveform
+        let chunkSize = Int(Float(sampleRate) * chunkSizeSeconds)
+        let out2D = chunkedHannOLA(
+            wave: wave2D,
+            chunkSize: chunkSize,
+            hopPortion: hopPortion,
+            batchSize: 4
+        ) { [weak self] chunk in
+            guard let self = self else { return chunk }
+            return self.enhanceChunk(
+                chunk,
+                sampleRate: sampleRate,
+                exitLayer: exitLayer,
+                lookAheadFrames: lookAheadFrames
+            )
+        }
+        eval(out2D)
+        return out2D
+    }
+
+    public func enhanceStreaming(
+        waveform: MLXArray,
+        sampleRate: Int,
+        exitLayer: Int = 8,
+        lookAheadFrames: Int = 0
+    ) -> MLXArray {
+        let wave2D = waveform.ndim == 1 ? expandedDimensions(waveform, axis: 0) : waveform
+        let params = realtimeSTFTParams(for: sampleRate)
+        let (mag, pha) = magPhaseSTFT(
+            wave: wave2D,
+            nFFT: params.nFFT,
+            hop: params.hop,
+            win: params.win,
+            compressFactor: compressFactor,
+            center: true,
+            addEps: false
+        )
+
+        let streamer = RealtimeStreamingSEMamba(model: model)
+        streamer.reset(batchSize: mag.dim(0), freqBins: mag.dim(1))
+
+        var magOut: [MLXArray] = []
+        var phaOut: [MLXArray] = []
+        for t in 0 ..< mag.dim(2) {
+            if let (m, p) = streamer.step(
+                noisyMag: mag[0..., 0..., t],
+                noisyPhase: pha[0..., 0..., t],
+                exitLayer: exitLayer,
+                lookAheadFrames: lookAheadFrames
+            ) {
+                magOut.append(expandedDimensions(m, axis: -1))
+                phaOut.append(expandedDimensions(p, axis: -1))
+            }
+        }
+        for (m, p) in streamer.flush(exitLayer: exitLayer, lookAheadFrames: lookAheadFrames) {
+            magOut.append(expandedDimensions(m, axis: -1))
+            phaOut.append(expandedDimensions(p, axis: -1))
+        }
+
+        let amp = sweepArtifactFilter(concatenated(magOut, axis: -1))
+        let phase = concatenated(phaOut, axis: -1)
+        let out = magPhaseISTFT(
+            mag: amp,
+            phase: phase,
+            nFFT: params.nFFT,
+            hop: params.hop,
+            win: params.win,
+            compressFactor: compressFactor,
+            center: true
+        )
+        eval(out)
+        return clip(out, min: -1.0, max: 1.0)
+    }
+}

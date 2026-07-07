@@ -4,6 +4,8 @@ Native Swift implementation for running the RE-USE / SEMamba speech-enhancement 
 
 This package is meant for the `faraday/re-use-mlx` checkpoint, which contains `model_mlx.safetensors` converted for Apple Silicon / MLX / MLX Swift use. The code also accepts a direct `.safetensors` path.
 
+It also includes a second native Swift/MLX path for NVIDIA's `nvidia/Real-time_RE-USE` checkpoint. That model exposes early exits and look-ahead settings for latency/quality trade-offs.
+
 ## Contents
 
 ```text
@@ -17,6 +19,7 @@ Sources/
     Enhancer.swift        # waveform -> model -> waveform pipeline
     WavIO.swift           # minimal WAV reader/writer
     DepthwiseConv.swift   # custom Metal depthwise causal 1D conv kernel
+    RealtimeSEMamba.swift # NVIDIA Real-time RE-USE architecture + streaming API
     Profiler.swift        # helper utility for debugging module execution times
   reuse-fast-cli/
     main.swift            # CLI for inference and scan benchmark
@@ -35,6 +38,7 @@ Sources/
 ```bash
 pip install 'huggingface_hub[hf_xet]'
 huggingface-cli download --local-dir re-use-mlx faraday/re-use-mlx
+huggingface-cli download --local-dir realtime-reuse nvidia/Real-time_RE-USE
 ```
 
 The loader looks for either:
@@ -44,6 +48,8 @@ re-use-mlx/model_mlx.safetensors
 re-use-mlx/model.safetensors
 /path/to/file.safetensors
 ```
+
+For the real-time model, pass `--model realtime --weights realtime-reuse`.
 
 ## Build
 
@@ -84,6 +90,29 @@ With the Xcode build path:
   --output clean.wav
 ```
 
+Run NVIDIA Real-time RE-USE with the default low-latency preset (`exitLayer=8`, `lookAheadFrames=0`):
+
+```bash
+.build/release/reuse-fast-cli \
+  --model realtime \
+  --weights realtime-reuse \
+  --input noisy.wav \
+  --output clean.wav \
+  --exit-layer 8 \
+  --look-ahead-frames 0
+```
+
+Use the stateful one-frame API for file inference:
+
+```bash
+.build/release/reuse-fast-cli \
+  --model realtime \
+  --weights realtime-reuse \
+  --input noisy.wav \
+  --output clean.wav \
+  --streaming
+```
+
 Useful flags:
 
 ```bash
@@ -95,12 +124,28 @@ Useful flags:
 --print-model-keys       # inspect expected Swift model keys
 --verify-scan            # numerically verify fused scan kernel correctness
 --compare-scan           # compare speed of fused vs parallel scan
+--model realtime         # use nvidia/Real-time_RE-USE instead of faraday/re-use-mlx
+--exit-layer 8           # real-time model exit layer: 3...12
+--look-ahead-frames 0    # real-time model look-ahead frames: 0...2
+--streaming              # drive real-time inference through the stateful frame API
+--benchmark-realtime     # report real-time per-frame latency and RTF
 ```
 
 ## Benchmark only the fused selective scan
 
 ```bash
 .build/release/reuse-fast-cli --benchmark-scan
+```
+
+Benchmark the real-time model:
+
+```bash
+.build/release/reuse-fast-cli \
+  --model realtime \
+  --weights realtime-reuse \
+  --benchmark-realtime \
+  --exit-layer 8 \
+  --look-ahead-frames 0
 ```
 
 RE-USE-like defaults (channels-last layout) are:
@@ -179,5 +224,6 @@ That avoids the expensive pure-Swift or pure-MLX loop over sequence length and a
 
 - This targets MLX/Metal GPU execution, not the Apple Neural Engine.
 - The model code is keyed for the Faraday MLX/Swift safetensors naming convention and includes aliases for common Python/camelCase variants. If loading fails, run `--print-checkpoint-keys` and compare with `--print-model-keys`.
+- The real-time model path is keyed for NVIDIA's PyTorch-style `nvidia/Real-time_RE-USE/model.safetensors` and converts Conv2d/Conv1d tensor layouts while loading.
 - The WAV writer emits mono 32-bit IEEE float WAV.
-- The RE-USE license in the model card is non-commercial. Check it before using the model outside research/education.
+- The NVIDIA Real-time RE-USE license in the model card is non-commercial. Check it before using the model outside research/education.

@@ -22,27 +22,39 @@ enum CLIError: Error, LocalizedError {
     case missingValue(String)
     case unknownFlag(String)
     case missingRequired(String)
+    case invalidValue(String)
 
     var errorDescription: String? {
         switch self {
         case .missingValue(let flag): return "Missing value for \(flag)"
         case .unknownFlag(let flag): return "Unknown flag: \(flag)"
         case .missingRequired(let name): return "Missing required argument: \(name)"
+        case .invalidValue(let message): return message
         }
     }
 }
 
+enum ModelKind: String {
+    case reuse
+    case realtime
+}
+
 struct Options {
+    var modelKind: ModelKind = .reuse
     var weightsPath: String?
     var inputPath: String?
     var outputPath: String?
     var chunkSizeSeconds: Float = 1.0
     var hopPortion: Float = 0.5
+    var exitLayer: Int = 8
+    var lookAheadFrames: Int = 0
+    var streaming: Bool = false
     var strict: Bool = false
     var dtype: DType = .bfloat16
     var printModelKeys: Bool = false
     var printCheckpointKeys: Bool = false
     var benchmarkScan: Bool = false
+    var benchmarkRealtime: Bool = false
     var verifyScan: Bool = false
     var compareScan: Bool = false
     var benchmarkIterations: Int = 50
@@ -62,10 +74,17 @@ func printUsage() {
       --output clean.wav         Output mono float32 WAV
 
     Common options:
+      --model reuse              Model path: reuse (default) | realtime
       --chunk-size-s 1.0         Chunk size in seconds for long files. Default: 1.0
       --hop-portion 0.5          Chunk overlap hop ratio. Default: 0.5
       --dtype bf16               Compute dtype: bf16 (default, faster) | fp32 (exact) | fp16 (fastest, unstable)
       --strict                   Verify all checkpoint keys and shapes while loading
+
+    Real-time RE-USE options:
+      --exit-layer 8             Real-time model exit layer, 3...12. Default: 8
+      --look-ahead-frames 0      Real-time look-ahead frames, 0...2. Default: 0
+      --streaming                Use the stateful one-frame API for real-time file inference
+      --benchmark-realtime       Benchmark real-time model per-frame latency and RTF
 
     Diagnostics:
       --print-model-keys         Print expected SEMamba parameter keys and exit
@@ -83,6 +102,7 @@ func printUsage() {
 
     Download weights:
       huggingface-cli download --local-dir re-use-mlx faraday/re-use-mlx
+      huggingface-cli download --local-dir realtime-reuse nvidia/Real-time_RE-USE
     """)
 }
 
@@ -102,6 +122,12 @@ func parseOptions(_ args: [String]) throws -> Options {
         case "-h", "--help":
             printUsage()
             exit(0)
+        case "--model":
+            let raw = try takeValue(arg).lowercased()
+            guard let modelKind = ModelKind(rawValue: raw) else {
+                throw CLIError.invalidValue("--model must be reuse or realtime")
+            }
+            options.modelKind = modelKind
         case "--weights":
             options.weightsPath = try takeValue(arg)
         case "--input":
@@ -112,6 +138,12 @@ func parseOptions(_ args: [String]) throws -> Options {
             options.chunkSizeSeconds = Float(try takeValue(arg)) ?? options.chunkSizeSeconds
         case "--hop-portion":
             options.hopPortion = Float(try takeValue(arg)) ?? options.hopPortion
+        case "--exit-layer":
+            options.exitLayer = Int(try takeValue(arg)) ?? options.exitLayer
+        case "--look-ahead-frames":
+            options.lookAheadFrames = Int(try takeValue(arg)) ?? options.lookAheadFrames
+        case "--streaming":
+            options.streaming = true
         case "--strict":
             options.strict = true
         case "--dtype":
@@ -127,6 +159,8 @@ func parseOptions(_ args: [String]) throws -> Options {
             options.printCheckpointKeys = true
         case "--benchmark-scan":
             options.benchmarkScan = true
+        case "--benchmark-realtime":
+            options.benchmarkRealtime = true
         case "--verify-scan":
             options.verifyScan = true
         case "--compare-scan":
@@ -146,24 +180,79 @@ func parseOptions(_ args: [String]) throws -> Options {
         }
         i += 1
     }
+    if !(3 ... 12).contains(options.exitLayer) {
+        throw CLIError.invalidValue("--exit-layer must be between 3 and 12")
+    }
+    if !(0 ... 2).contains(options.lookAheadFrames) {
+        throw CLIError.invalidValue("--look-ahead-frames must be between 0 and 2")
+    }
     return options
 }
 
-func printExpectedModelKeys() {
-    let model = SEMamba()
-    for (key, param) in model.parameters().flattened().sorted(by: { $0.0 < $1.0 }) {
+func printExpectedModelKeys(_ modelKind: ModelKind) {
+    let params: [(String, MLXArray)]
+    switch modelKind {
+    case .reuse:
+        params = SEMamba().parameters().flattened()
+    case .realtime:
+        params = RealtimeSEMamba().parameters().flattened()
+    }
+    for (key, param) in params.sorted(by: { $0.0 < $1.0 }) {
         print("\(key) \(param.shape) \(param.dtype)")
     }
 }
 
-func printCheckpointKeys(weightsPath: String) throws {
+func printCheckpointKeys(weightsPath: String, modelKind: ModelKind) throws {
     let url = try ReuseModelLoader.resolveWeights(URL(fileURLWithPath: weightsPath))
     let arrays = try loadArrays(url: url)
-    let sanitized = ReuseModelLoader.sanitize(weights: arrays)
+    let sanitized: [String: MLXArray]
+    switch modelKind {
+    case .reuse:
+        sanitized = ReuseModelLoader.sanitize(weights: arrays)
+    case .realtime:
+        sanitized = ReuseModelLoader.sanitizeRealtime(weights: arrays)
+    }
     for key in sanitized.keys.sorted() {
         let value = sanitized[key]!
         print("\(key) \(value.shape) \(value.dtype)")
     }
+}
+
+func benchmarkRealtime(_ options: Options) throws {
+    guard options.modelKind == .realtime else {
+        throw CLIError.invalidValue("--benchmark-realtime requires --model realtime")
+    }
+    guard let weightsPath = options.weightsPath else { throw CLIError.missingRequired("--weights") }
+    let weightsURL = URL(fileURLWithPath: weightsPath)
+    let model = try ReuseModelLoader.loadRealtimeSEMamba(weightsAt: weightsURL, strict: options.strict, dtype: options.dtype)
+
+    let freqBins = 161
+    let warmupFrames = max(4, options.lookAheadFrames + 2)
+    let frames = max(20, options.benchmarkIterations)
+    let mag = MLXArray.ones([1, freqBins, warmupFrames + frames], dtype: .float32) * 0.01
+    let pha = MLXArray.zeros([1, freqBins, warmupFrames + frames], dtype: .float32)
+    let streamer = RealtimeStreamingSEMamba(model: model)
+    streamer.reset(batchSize: 1, freqBins: freqBins)
+
+    for t in 0 ..< warmupFrames {
+        _ = streamer.step(noisyMag: mag[0..., 0..., t], noisyPhase: pha[0..., 0..., t], exitLayer: options.exitLayer, lookAheadFrames: options.lookAheadFrames)
+    }
+    eval(mag, pha)
+
+    let start = DispatchTime.now().uptimeNanoseconds
+    var emitted = 0
+    for t in warmupFrames ..< (warmupFrames + frames) {
+        if let (m, p) = streamer.step(noisyMag: mag[0..., 0..., t], noisyPhase: pha[0..., 0..., t], exitLayer: options.exitLayer, lookAheadFrames: options.lookAheadFrames) {
+            eval(m, p)
+            emitted += 1
+        }
+    }
+    let elapsedMS = Double(DispatchTime.now().uptimeNanoseconds - start) / 1_000_000.0
+    let perFrameMS = elapsedMS / Double(max(1, emitted))
+    let hopMS = 5.0
+    print("realtime benchmark: exitLayer=\(options.exitLayer) lookAheadFrames=\(options.lookAheadFrames) emittedFrames=\(emitted)")
+    print(String(format: "per-frame latency: %.3f ms", perFrameMS))
+    print(String(format: "real-time factor: %.3f", perFrameMS / hopMS))
 }
 
 /// Naive reference selective scan in pure MLX (channels-last), used to validate the
@@ -376,16 +465,40 @@ func runInference(_ options: Options) throws {
     print("audio: \(audio.samples.count) samples @ \(audio.sampleRate) Hz")
 
     print("loading weights: \(try ReuseModelLoader.resolveWeights(weightsURL).path)")
-    let model = try ReuseModelLoader.loadSEMamba(weightsAt: weightsURL, strict: options.strict, dtype: options.dtype)
-    let enhancer = REUSEEnhancer(model: model)
-
-    print("running enhancement")
-    let output = enhancer.enhance(
-        waveform: audio.mlxMonoBatch,
-        sampleRate: audio.sampleRate,
-        chunkSizeSeconds: options.chunkSizeSeconds,
-        hopPortion: options.hopPortion
-    )
+    let output: MLXArray
+    switch options.modelKind {
+    case .reuse:
+        let model = try ReuseModelLoader.loadSEMamba(weightsAt: weightsURL, strict: options.strict, dtype: options.dtype)
+        let enhancer = REUSEEnhancer(model: model)
+        print("running enhancement")
+        output = enhancer.enhance(
+            waveform: audio.mlxMonoBatch,
+            sampleRate: audio.sampleRate,
+            chunkSizeSeconds: options.chunkSizeSeconds,
+            hopPortion: options.hopPortion
+        )
+    case .realtime:
+        let model = try ReuseModelLoader.loadRealtimeSEMamba(weightsAt: weightsURL, strict: options.strict, dtype: options.dtype)
+        let enhancer = RealtimeREUSEEnhancer(model: model)
+        print("running real-time enhancement: exitLayer=\(options.exitLayer) lookAheadFrames=\(options.lookAheadFrames) streaming=\(options.streaming)")
+        if options.streaming {
+            output = enhancer.enhanceStreaming(
+                waveform: audio.mlxMonoBatch,
+                sampleRate: audio.sampleRate,
+                exitLayer: options.exitLayer,
+                lookAheadFrames: options.lookAheadFrames
+            )
+        } else {
+            output = enhancer.enhance(
+                waveform: audio.mlxMonoBatch,
+                sampleRate: audio.sampleRate,
+                chunkSizeSeconds: options.chunkSizeSeconds,
+                hopPortion: options.hopPortion,
+                exitLayer: options.exitLayer,
+                lookAheadFrames: options.lookAheadFrames
+            )
+        }
+    }
     eval(output)
 
     print("writing wav: \(outputURL.path)")
@@ -397,13 +510,13 @@ do {
     let options = try parseOptions(CommandLine.arguments)
 
     if options.printModelKeys {
-        printExpectedModelKeys()
+        printExpectedModelKeys(options.modelKind)
         exit(0)
     }
 
     if options.printCheckpointKeys {
         guard let weightsPath = options.weightsPath else { throw CLIError.missingRequired("--weights") }
-        try printCheckpointKeys(weightsPath: weightsPath)
+        try printCheckpointKeys(weightsPath: weightsPath, modelKind: options.modelKind)
         exit(0)
     }
 
@@ -419,6 +532,11 @@ do {
 
     if options.benchmarkScan {
         benchmarkScan(options)
+        exit(0)
+    }
+
+    if options.benchmarkRealtime {
+        try benchmarkRealtime(options)
         exit(0)
     }
 

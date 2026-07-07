@@ -23,6 +23,7 @@ private let baseSR = 8000
 private let baseNFFT = 320
 private let baseHop = 40
 private let baseWin = 320
+private let realtimeBaseHop = 160
 
 public struct STFTParams: Sendable {
     public let nFFT: Int
@@ -39,6 +40,14 @@ public func stftParams(for sampleRate: Int) -> STFTParams {
         nFFT: baseNFFT,
         hop: baseHop,
         win: baseWin
+    )
+}
+
+public func realtimeSTFTParams(for sampleRate: Int) -> STFTParams {
+    STFTParams(
+        nFFT: makeEven(baseNFFT * sampleRate / baseSR),
+        hop: makeEven(realtimeBaseHop * sampleRate / baseSR),
+        win: makeEven(baseWin * sampleRate / baseSR)
     )
 }
 
