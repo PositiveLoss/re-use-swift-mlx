@@ -141,7 +141,7 @@ public final class RealtimeDenseEncoder: Module {
         self._denseConv12.wrappedValue = RealtimeConvNormAct(inChannels: inputChannel, outChannels: hidFeature, kernelSize: (3, 3), causal: false)
         self._denseConv13.wrappedValue = RealtimeConvNormAct(inChannels: inputChannel, outChannels: hidFeature, kernelSize: (3, 3), causal: false)
         self._denseBlock.wrappedValue = RealtimeDenseBlock(hidFeature: hidFeature)
-        self._denseConv2.wrappedValue = RealtimeConvNormAct(inChannels: hidFeature, outChannels: hidFeature, kernelSize: (1, 3), stride: (1, 2))
+        self._denseConv2.wrappedValue = RealtimeConvNormAct(inChannels: hidFeature, outChannels: hidFeature, kernelSize: (1, 3), stride: (1, 2), causal: false)
     }
 
     public func callAsFunction(_ x: MLXArray, lookAheadFrames: Int) -> MLXArray {
@@ -677,10 +677,9 @@ public final class RealtimeStreamingSEMamba {
         ) {
             self.batchSize = batchSize
             self.freqBins = freqBins
-            // The model appends two frequency bins before the stride-2 encoder conv:
-            // output width = floor(((freqBins + 2) + 2*pad - kernel) / 2) + 1
-            // with pad=1, kernel=3 -> floor((freqBins + 1) / 2) + 1.
-            let encoded = (freqBins + 1) / 2 + 1
+            // The model appends two frequency bins, then dense_conv_2 uses kernel=3,
+            // stride=2, and no padding: floor(((freqBins + 2) - 3) / 2) + 1.
+            let encoded = freqBins / 2 + 1
             self.encodedFreqBins = encoded
             self.exitLayer = exitLayer
             self.lookAheadFrames = lookAheadFrames

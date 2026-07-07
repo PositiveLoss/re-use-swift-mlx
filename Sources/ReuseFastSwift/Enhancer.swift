@@ -145,21 +145,12 @@ public final class RealtimeREUSEEnhancer {
         lookAheadFrames: Int = 0
     ) -> MLXArray {
         let wave2D = waveform.ndim == 1 ? expandedDimensions(waveform, axis: 0) : waveform
-        let chunkSize = Int(Float(sampleRate) * chunkSizeSeconds)
-        let out2D = chunkedHannOLA(
-            wave: wave2D,
-            chunkSize: chunkSize,
-            hopPortion: hopPortion,
-            batchSize: 4
-        ) { [weak self] chunk in
-            guard let self = self else { return chunk }
-            return self.enhanceChunk(
-                chunk,
-                sampleRate: sampleRate,
-                exitLayer: exitLayer,
-                lookAheadFrames: lookAheadFrames
-            )
-        }
+        let out2D = enhanceChunk(
+            wave2D,
+            sampleRate: sampleRate,
+            exitLayer: exitLayer,
+            lookAheadFrames: lookAheadFrames
+        )
         eval(out2D)
         return out2D
     }
