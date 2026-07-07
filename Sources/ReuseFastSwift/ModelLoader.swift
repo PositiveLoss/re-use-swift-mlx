@@ -148,6 +148,8 @@ public enum ReuseModelLoader {
                 k = k.replacingOccurrences(of: ".\(prefix).0.conv.", with: ".\(prefix).conv.conv.")
                 k = k.replacingOccurrences(of: ".\(prefix).1.norm.", with: ".\(prefix).norm.")
                 k = k.replacingOccurrences(of: ".\(prefix).2.", with: ".\(prefix).act.")
+                k = k.replacingOccurrences(of: ".\(prefix).norm.weight", with: ".\(prefix).norm.norm.weight")
+                k = k.replacingOccurrences(of: ".\(prefix).norm.bias", with: ".\(prefix).norm.norm.bias")
             }
 
             // SPUp uses `conv` for the sub-pixel wrapper, then another `conv` for
@@ -156,11 +158,6 @@ public enum ReuseModelLoader {
             k = k.replacingOccurrences(of: ".up_conv1.conv.bias", with: ".up_conv1.conv.conv.bias")
             k = k.replacingOccurrences(of: ".up_conv2.conv.weight", with: ".up_conv2.conv.conv.weight")
             k = k.replacingOccurrences(of: ".up_conv2.conv.bias", with: ".up_conv2.conv.conv.bias")
-
-            // The previous replacements also touch SPUp norm keys; those modules are
-            // plain InstanceNorm and should not receive an extra `.norm` segment.
-            k = k.replacingOccurrences(of: ".up_conv1.norm.norm.", with: ".up_conv1.norm.")
-            k = k.replacingOccurrences(of: ".up_conv2.norm.norm.", with: ".up_conv2.norm.")
 
             out[k] = convert(k, value)
         }

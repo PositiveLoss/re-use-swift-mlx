@@ -157,16 +157,85 @@ public final class RealtimeDenseEncoder: Module {
     }
 }
 
+public final class RealtimeSPConvTranspose2d: Module {
+    public let outChannels: Int
+    public let r: Int
+    public let padding: (left: Int, right: Int, top: Int, bottom: Int)
+    @ModuleInfo(key: "conv") public var conv: Conv2d
+
+    public init(
+        inChannels: Int,
+        outChannels: Int,
+        kernelSize: (Int, Int),
+        padding: (Int, Int, Int, Int),
+        r: Int = 1
+    ) {
+        self.outChannels = outChannels
+        self.r = r
+        self.padding = (padding.0, padding.1, padding.2, padding.3)
+        self._conv.wrappedValue = Conv2d(
+            inputChannels: inChannels,
+            outputChannels: outChannels * r,
+            kernelSize: IntOrPair(kernelSize),
+            stride: IntOrPair((1, 1)),
+            padding: IntOrPair((0, 0)),
+            bias: true
+        )
+    }
+
+    public func callAsFunction(_ x: MLXArray) -> MLXArray {
+        let paddedX = padded(
+            x,
+            widths: [
+                IntOrPair((0, 0)),
+                IntOrPair((0, 0)),
+                IntOrPair((padding.top, padding.bottom)),
+                IntOrPair((padding.left, padding.right)),
+            ]
+        )
+        var out = rtChannelsFirst(conv(rtChannelsLast(paddedX)))
+        let b = out.dim(0)
+        let nch = out.dim(1)
+        let h = out.dim(2)
+        let w = out.dim(3)
+        out = out.reshaped(b, r, nch / r, h, w)
+        out = out.transposed(0, 2, 3, 4, 1)
+        return out.reshaped(b, nch / r, h, -1)
+    }
+}
+
+public final class RealtimeSPUp: Module {
+    @ModuleInfo(key: "conv") public var conv: RealtimeSPConvTranspose2d
+    @ModuleInfo(key: "norm") public var norm: ChannelLayerNorm2D
+    @ModuleInfo(key: "act") public var act: ChannelFirstPReLU
+
+    public init(inChannels: Int, outChannels: Int, padding: (Int, Int, Int, Int), r: Int) {
+        self._conv.wrappedValue = RealtimeSPConvTranspose2d(
+            inChannels: inChannels,
+            outChannels: outChannels,
+            kernelSize: (1, 3),
+            padding: padding,
+            r: r
+        )
+        self._norm.wrappedValue = ChannelLayerNorm2D(channels: outChannels)
+        self._act.wrappedValue = ChannelFirstPReLU(channels: outChannels)
+    }
+
+    public func callAsFunction(_ x: MLXArray) -> MLXArray {
+        act(norm(conv(x)))
+    }
+}
+
 public final class RealtimeMagDecoder: Module {
     @ModuleInfo(key: "dense_block") public var denseBlock: RealtimeDenseBlock
-    @ModuleInfo(key: "up_conv1") public var upConv1: SPUp
-    @ModuleInfo(key: "up_conv2") public var upConv2: SPUp
+    @ModuleInfo(key: "up_conv1") public var upConv1: RealtimeSPUp
+    @ModuleInfo(key: "up_conv2") public var upConv2: RealtimeSPUp
     @ModuleInfo(key: "final_conv") public var finalConv: Conv2d
 
     public init(hidFeature: Int = 64, outputChannel: Int = 1) {
         self._denseBlock.wrappedValue = RealtimeDenseBlock(hidFeature: hidFeature)
-        self._upConv1.wrappedValue = SPUp(inChannels: hidFeature, outChannels: hidFeature, r: 2)
-        self._upConv2.wrappedValue = SPUp(inChannels: hidFeature, outChannels: hidFeature, r: 1)
+        self._upConv1.wrappedValue = RealtimeSPUp(inChannels: hidFeature, outChannels: hidFeature, padding: (1, 1, 0, 0), r: 2)
+        self._upConv2.wrappedValue = RealtimeSPUp(inChannels: hidFeature, outChannels: hidFeature, padding: (2, 0, 0, 0), r: 1)
         self._finalConv.wrappedValue = Conv2d(inputChannels: hidFeature, outputChannels: outputChannel, kernelSize: IntOrPair((1, 1)), bias: true)
     }
 
@@ -180,15 +249,15 @@ public final class RealtimeMagDecoder: Module {
 
 public final class RealtimePhaseDecoder: Module {
     @ModuleInfo(key: "dense_block") public var denseBlock: RealtimeDenseBlock
-    @ModuleInfo(key: "up_conv1") public var upConv1: SPUp
-    @ModuleInfo(key: "up_conv2") public var upConv2: SPUp
+    @ModuleInfo(key: "up_conv1") public var upConv1: RealtimeSPUp
+    @ModuleInfo(key: "up_conv2") public var upConv2: RealtimeSPUp
     @ModuleInfo(key: "phase_conv_r") public var phaseConvR: Conv2d
     @ModuleInfo(key: "phase_conv_i") public var phaseConvI: Conv2d
 
     public init(hidFeature: Int = 64, outputChannel: Int = 1) {
         self._denseBlock.wrappedValue = RealtimeDenseBlock(hidFeature: hidFeature)
-        self._upConv1.wrappedValue = SPUp(inChannels: hidFeature, outChannels: hidFeature, r: 2)
-        self._upConv2.wrappedValue = SPUp(inChannels: hidFeature, outChannels: hidFeature, r: 1)
+        self._upConv1.wrappedValue = RealtimeSPUp(inChannels: hidFeature, outChannels: hidFeature, padding: (1, 1, 0, 0), r: 2)
+        self._upConv2.wrappedValue = RealtimeSPUp(inChannels: hidFeature, outChannels: hidFeature, padding: (2, 0, 0, 0), r: 1)
         self._phaseConvR.wrappedValue = Conv2d(inputChannels: hidFeature, outputChannels: outputChannel, kernelSize: IntOrPair((1, 1)), bias: true)
         self._phaseConvI.wrappedValue = Conv2d(inputChannels: hidFeature, outputChannels: outputChannel, kernelSize: IntOrPair((1, 1)), bias: true)
     }
@@ -431,10 +500,10 @@ fileprivate final class StreamingFTConvState {
 }
 
 fileprivate final class StreamingFTConv {
-    let up: SPUp
+    let up: RealtimeSPUp
     let cacheLen: Int
 
-    init(_ up: SPUp) {
+    init(_ up: RealtimeSPUp) {
         self.up = up
         let kw = up.conv.conv.weight.shape[2]
         self.cacheLen = kw - 1
@@ -451,7 +520,7 @@ fileprivate final class StreamingFTConv {
         let cache = state.cache ?? MLXArray.zeros([b, c, f, cacheLen], dtype: x.dtype)
         let xCat = concatenated([cache, x], axis: 3)
         let convOut = rtChannelsFirst(up.conv.conv(rtChannelsLast(xCat)))
-        let y = up.act(rtChannelsFirst(up.norm(rtChannelsLast(convOut))))
+        let y = up.act(up.norm(convOut))
         let totalT = xCat.dim(3)
         state.cache = xCat[0..., 0..., 0..., (totalT - cacheLen) ..< totalT]
         return y
