@@ -234,10 +234,14 @@ func benchmarkRealtime(_ options: Options) throws {
     let streamer = RealtimeStreamingSEMamba(model: model)
     streamer.reset(batchSize: 1, freqBins: freqBins)
 
+    let warmupStart = DispatchTime.now().uptimeNanoseconds
+    var warmupEmitted = 0
     for t in 0 ..< warmupFrames {
         _ = streamer.step(noisyMag: mag[0..., 0..., t], noisyPhase: pha[0..., 0..., t], exitLayer: options.exitLayer, lookAheadFrames: options.lookAheadFrames)
+        warmupEmitted += 1
     }
     eval(mag, pha)
+    let warmupMS = Double(DispatchTime.now().uptimeNanoseconds - warmupStart) / 1_000_000.0
 
     let start = DispatchTime.now().uptimeNanoseconds
     var emitted = 0
@@ -250,8 +254,9 @@ func benchmarkRealtime(_ options: Options) throws {
     let elapsedMS = Double(DispatchTime.now().uptimeNanoseconds - start) / 1_000_000.0
     let perFrameMS = elapsedMS / Double(max(1, emitted))
     let hopMS = 5.0
-    print("realtime benchmark: exitLayer=\(options.exitLayer) lookAheadFrames=\(options.lookAheadFrames) emittedFrames=\(emitted)")
-    print(String(format: "per-frame latency: %.3f ms", perFrameMS))
+    print("realtime benchmark: exitLayer=\(options.exitLayer) lookAheadFrames=\(options.lookAheadFrames)")
+    print(String(format: "warmup: %d frames in %.3f ms", warmupEmitted, warmupMS))
+    print(String(format: "measured: %d frames, avg per-frame latency %.3f ms", emitted, perFrameMS))
     print(String(format: "real-time factor: %.3f", perFrameMS / hopMS))
 }
 

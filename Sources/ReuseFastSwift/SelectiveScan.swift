@@ -129,6 +129,61 @@ public enum ReuseSelectiveScan {
         """
     )
 
+    private static let stepKernel = MLXFast.metalKernel(
+        name: "reuse_semamba_selective_scan_step",
+        inputNames: ["u", "delta", "A", "Bvar", "Cvar", "Dvec", "z", "deltaBias", "state", "params"],
+        outputNames: ["out", "newState"],
+        source: """
+        uint lane = thread_position_in_grid.x;
+
+        uint dim = uint(params[0]);
+        uint dstate = uint(params[1]);
+        bool hasD = uint(params[2]) != 0;
+        bool hasZ = uint(params[3]) != 0;
+        bool hasDeltaBias = uint(params[4]) != 0;
+        bool deltaSoftplus = uint(params[5]) != 0;
+
+        uint b = lane / dim;
+        uint d = lane - b * dim;
+        uint udx = b * dim + d;
+        uint stateBase = (b * dim + d) * dstate;
+
+        float uVal = float(u[udx]);
+        float dt = float(delta[udx]);
+        if (hasDeltaBias) {
+            dt += float(deltaBias[d]);
+        }
+        if (deltaSoftplus) {
+            if (dt > 20.0f) {
+            } else if (dt < -20.0f) {
+                dt = fast::exp(dt);
+            } else {
+                dt = fast::log(1.0f + fast::exp(dt));
+            }
+        }
+
+        float acc = 0.0f;
+        float dt_log2e = dt * 1.4426950408889634f;
+        for (uint n = 0; n < dstate; ++n) {
+            uint sidx = stateBase + n;
+            float aBar = fast::exp2(dt_log2e * float(A[d * dstate + n]));
+            float bBar = dt * float(Bvar[b * dstate + n]) * uVal;
+            float next = aBar * float(state[sidx]) + bBar;
+            newState[sidx] = static_cast<T>(next);
+            acc += next * float(Cvar[b * dstate + n]);
+        }
+
+        if (hasD) {
+            acc += float(Dvec[d]) * uVal;
+        }
+        if (hasZ) {
+            float zVal = float(z[udx]);
+            acc *= zVal / (1.0f + fast::exp(-zVal));
+        }
+        out[udx] = static_cast<T>(acc);
+        """
+    )
+
     /// Fused selective scan on **channels-last** tensors:
     ///
     ///   u, delta, z: [B, L, dInner]
@@ -207,5 +262,76 @@ public enum ReuseSelectiveScan {
             outputShapes: [u.shape],
             outputDTypes: [outputDType]
         )[0]
+    }
+
+    /// One-token selective scan on channels-last tensors:
+    ///
+    ///   u, delta, z: [B, dInner]
+    ///   Bvar, Cvar:  [B, dState]
+    ///   state:       [B, dInner, dState]
+    public static func step(
+        u: MLXArray,
+        delta: MLXArray,
+        A: MLXArray,
+        Bvar: MLXArray,
+        Cvar: MLXArray,
+        D: MLXArray?,
+        z: MLXArray?,
+        deltaBias: MLXArray?,
+        state: MLXArray,
+        deltaSoftplus: Bool = true,
+        outputDType: DType = .float32
+    ) -> (MLXArray, MLXArray) {
+        precondition(u.shape.count == 2, "u must be [B, dInner]")
+        precondition(delta.shape == u.shape, "delta shape must match u")
+        precondition(z == nil || z!.shape == u.shape, "z shape must match u")
+        precondition(A.shape.count == 2, "A must be [dInner, dState]")
+        precondition(Bvar.shape.count == 2, "Bvar must be [B, dState]")
+        precondition(Cvar.shape == Bvar.shape, "Cvar shape must match Bvar")
+
+        let batch = u.shape[0]
+        let dim = u.shape[1]
+        let dState = A.shape[1]
+        precondition(A.shape[0] == dim, "A.shape[0] must equal dInner")
+        precondition(Bvar.shape == [batch, dState], "Bvar must be [B, dState]")
+        precondition(state.shape == [batch, dim, dState], "state must be [B, dInner, dState]")
+        precondition(dState <= maxRegisterState, "dState \(dState) exceeds maxRegisterState \(maxRegisterState)")
+        precondition(D == nil || D!.shape == [dim], "D must be [dInner]")
+        precondition(deltaBias == nil || deltaBias!.shape == [dim], "deltaBias must be [dInner]")
+
+        let dVec = contiguous(D ?? MLXArray.zeros([dim], dtype: u.dtype))
+        let zVal = contiguous(z ?? MLXArray.zeros(u.shape, dtype: u.dtype))
+        let bias = contiguous(deltaBias ?? MLXArray.zeros([dim], dtype: u.dtype))
+        let params = MLXArray([
+            Float(dim),
+            Float(dState),
+            D == nil ? 0.0 : 1.0,
+            z == nil ? 0.0 : 1.0,
+            deltaBias == nil ? 0.0 : 1.0,
+            deltaSoftplus ? 1.0 : 0.0,
+        ]).asType(.float32)
+
+        let lanes = batch * dim
+        let threadGroup = min(256, max(1, lanes))
+        let outputs = stepKernel(
+            [
+                contiguous(u),
+                contiguous(delta),
+                contiguous(A),
+                contiguous(Bvar),
+                contiguous(Cvar),
+                dVec,
+                zVal,
+                bias,
+                contiguous(state),
+                params,
+            ],
+            template: [("T", outputDType)],
+            grid: (lanes, 1, 1),
+            threadGroup: (threadGroup, 1, 1),
+            outputShapes: [u.shape, state.shape],
+            outputDTypes: [outputDType, outputDType]
+        )
+        return (outputs[0], outputs[1])
     }
 }

@@ -307,70 +307,422 @@ public final class RealtimeSEMamba: Module {
     }
 }
 
+fileprivate final class StreamingConv2DState {
+    var cache: MLXArray?
+}
+
+fileprivate final class StreamingConv2D {
+    let layer: RealtimeConvNormAct
+    let cacheLen: Int
+    let freqPadLeft: Int
+    let freqPadRight: Int
+
+    init(layer: RealtimeConvNormAct, freqPadLeft: Int? = nil, freqPadRight: Int? = nil) {
+        self.layer = layer
+        let kt = layer.conv.weight.shape[1]
+        self.cacheLen = (kt - 1) * layer.conv.dilation.0
+        self.freqPadLeft = freqPadLeft ?? layer.padLeft
+        self.freqPadRight = freqPadRight ?? layer.padRight
+    }
+
+    func makeState() -> StreamingConv2DState {
+        StreamingConv2DState()
+    }
+
+    func step(_ x: MLXArray, state: StreamingConv2DState, initialTop: Int? = nil) -> MLXArray {
+        if cacheLen == 0 {
+            return layer(x)
+        }
+
+        let b = x.dim(0)
+        let c = x.dim(1)
+        let f = x.dim(3)
+        let cache = state.cache ?? MLXArray.zeros([b, c, initialTop ?? cacheLen, f], dtype: x.dtype)
+        let xCat = concatenated([cache, x], axis: 2)
+        let paddedX = rtPadTimeFreq(xCat, top: 0, left: freqPadLeft, right: freqPadRight)
+        let y = layer.act(layer.norm(rtChannelsFirst(layer.conv(rtChannelsLast(paddedX)))))
+
+        let totalT = xCat.dim(2)
+        state.cache = xCat[0..., 0..., (totalT - cacheLen) ..< totalT, 0...]
+        return y
+    }
+}
+
+fileprivate final class StreamingDenseBlockState {
+    let layerStates: [StreamingConv2DState]
+
+    init(layers: [StreamingConv2D]) {
+        self.layerStates = layers.map { $0.makeState() }
+    }
+}
+
+fileprivate final class StreamingDenseBlock {
+    let layers: [StreamingConv2D]
+
+    init(_ block: RealtimeDenseBlock) {
+        self.layers = block.dense_block.map { StreamingConv2D(layer: $0) }
+    }
+
+    func makeState() -> StreamingDenseBlockState {
+        StreamingDenseBlockState(layers: layers)
+    }
+
+    func step(_ x: MLXArray, state: StreamingDenseBlockState) -> MLXArray {
+        var skip = x
+        var out = x
+        for i in 0 ..< layers.count {
+            out = layers[i].step(skip, state: state.layerStates[i])
+            skip = concatenated([out, skip], axis: 1)
+        }
+        return out
+    }
+}
+
+fileprivate final class StreamingDenseEncoderState {
+    let conv11: StreamingConv2DState
+    let conv12: StreamingConv2DState
+    let conv13: StreamingConv2DState
+    let denseBlock: StreamingDenseBlockState
+
+    init(encoder: StreamingDenseEncoder) {
+        self.conv11 = encoder.conv11.makeState()
+        self.conv12 = encoder.conv12.makeState()
+        self.conv13 = encoder.conv13.makeState()
+        self.denseBlock = encoder.denseBlock.makeState()
+    }
+}
+
+fileprivate final class StreamingDenseEncoder {
+    let conv11: StreamingConv2D
+    let conv12: StreamingConv2D
+    let conv13: StreamingConv2D
+    let denseBlock: StreamingDenseBlock
+    let conv2: RealtimeConvNormAct
+
+    init(_ encoder: RealtimeDenseEncoder) {
+        self.conv11 = StreamingConv2D(layer: encoder.denseConv11, freqPadLeft: 1, freqPadRight: 1)
+        self.conv12 = StreamingConv2D(layer: encoder.denseConv12, freqPadLeft: 1, freqPadRight: 1)
+        self.conv13 = StreamingConv2D(layer: encoder.denseConv13, freqPadLeft: 1, freqPadRight: 1)
+        self.denseBlock = StreamingDenseBlock(encoder.denseBlock)
+        self.conv2 = encoder.denseConv2
+    }
+
+    func makeState() -> StreamingDenseEncoderState {
+        StreamingDenseEncoderState(encoder: self)
+    }
+
+    func step(_ x: MLXArray, state: StreamingDenseEncoderState, lookAheadFrames: Int, initial: Bool) -> MLXArray {
+        let top = initial ? 2 - lookAheadFrames : nil
+        let first: MLXArray
+        switch lookAheadFrames {
+        case 0:
+            first = conv11.step(x, state: state.conv11, initialTop: top)
+        case 1:
+            first = conv12.step(x, state: state.conv12, initialTop: top)
+        default:
+            first = conv13.step(x, state: state.conv13, initialTop: top)
+        }
+        return conv2(denseBlock.step(first, state: state.denseBlock))
+    }
+}
+
+fileprivate final class StreamingFTConvState {
+    var cache: MLXArray?
+}
+
+fileprivate final class StreamingFTConv {
+    let up: SPUp
+    let cacheLen: Int
+
+    init(_ up: SPUp) {
+        self.up = up
+        let kw = up.conv.conv.weight.shape[2]
+        self.cacheLen = kw - 1
+    }
+
+    func makeState() -> StreamingFTConvState {
+        StreamingFTConvState()
+    }
+
+    func step(_ x: MLXArray, state: StreamingFTConvState) -> MLXArray {
+        let b = x.dim(0)
+        let c = x.dim(1)
+        let f = x.dim(2)
+        let cache = state.cache ?? MLXArray.zeros([b, c, f, cacheLen], dtype: x.dtype)
+        let xCat = concatenated([cache, x], axis: 3)
+        let convOut = rtChannelsFirst(up.conv.conv(rtChannelsLast(xCat)))
+        let y = up.act(rtChannelsFirst(up.norm(rtChannelsLast(convOut))))
+        let totalT = xCat.dim(3)
+        state.cache = xCat[0..., 0..., 0..., (totalT - cacheLen) ..< totalT]
+        return y
+    }
+}
+
+fileprivate final class StreamingMagDecoderState {
+    let denseBlock: StreamingDenseBlockState
+    let upConv2: StreamingFTConvState
+
+    init(decoder: StreamingMagDecoder) {
+        self.denseBlock = decoder.denseBlock.makeState()
+        self.upConv2 = decoder.upConv2.makeState()
+    }
+}
+
+fileprivate final class StreamingMagDecoder {
+    let decoder: RealtimeMagDecoder
+    let denseBlock: StreamingDenseBlock
+    let upConv2: StreamingFTConv
+
+    init(_ decoder: RealtimeMagDecoder) {
+        self.decoder = decoder
+        self.denseBlock = StreamingDenseBlock(decoder.denseBlock)
+        self.upConv2 = StreamingFTConv(decoder.upConv2)
+    }
+
+    func makeState() -> StreamingMagDecoderState {
+        StreamingMagDecoderState(decoder: self)
+    }
+
+    func step(_ x: MLXArray, state: StreamingMagDecoderState, outputFreqBins: Int) -> MLXArray {
+        var h = denseBlock.step(x, state: state.denseBlock)
+        h = decoder.upConv1(h)
+        h = upConv2.step(h.transposed(0, 1, 3, 2), state: state.upConv2).transposed(0, 1, 3, 2)
+        let y = rtChannelsFirst(decoder.finalConv(rtChannelsLast(h)))
+        return y[0..., 0, 0, 0 ..< outputFreqBins]
+    }
+}
+
+fileprivate final class StreamingPhaseDecoderState {
+    let denseBlock: StreamingDenseBlockState
+    let upConv2: StreamingFTConvState
+
+    init(decoder: StreamingPhaseDecoder) {
+        self.denseBlock = decoder.denseBlock.makeState()
+        self.upConv2 = decoder.upConv2.makeState()
+    }
+}
+
+fileprivate final class StreamingPhaseDecoder {
+    let decoder: RealtimePhaseDecoder
+    let denseBlock: StreamingDenseBlock
+    let upConv2: StreamingFTConv
+
+    init(_ decoder: RealtimePhaseDecoder) {
+        self.decoder = decoder
+        self.denseBlock = StreamingDenseBlock(decoder.denseBlock)
+        self.upConv2 = StreamingFTConv(decoder.upConv2)
+    }
+
+    func makeState() -> StreamingPhaseDecoderState {
+        StreamingPhaseDecoderState(decoder: self)
+    }
+
+    func step(_ x: MLXArray, state: StreamingPhaseDecoderState, outputFreqBins: Int) -> MLXArray {
+        var h = denseBlock.step(x, state: state.denseBlock)
+        h = decoder.upConv1(h)
+        h = upConv2.step(h.transposed(0, 1, 3, 2), state: state.upConv2).transposed(0, 1, 3, 2)
+        let xr = rtChannelsFirst(decoder.phaseConvR(rtChannelsLast(h)))
+        let xi = rtChannelsFirst(decoder.phaseConvI(rtChannelsLast(h)))
+        let y = atan2(xi, xr)
+        return y[0..., 0, 0, 0 ..< outputFreqBins]
+    }
+}
+
+fileprivate final class StreamingCausalMambaBlockState {
+    let forward: MambaSSMState
+
+    init(block: RealtimeCausalMambaBlock, batchSize: Int, dtype: DType) {
+        self.forward = MambaSSMState(
+            batchSize: batchSize,
+            dInner: block.forwardBlocks.dInner,
+            dConv: block.forwardBlocks.dConv,
+            dState: block.forwardBlocks.dState,
+            dtype: dtype
+        )
+    }
+}
+
+fileprivate final class StreamingTFMambaBlockState {
+    let timeMamba: StreamingCausalMambaBlockState
+
+    init(block: RealtimeTFMambaBlock, batchSize: Int, dtype: DType) {
+        self.timeMamba = StreamingCausalMambaBlockState(block: block.timeMamba, batchSize: batchSize, dtype: dtype)
+    }
+}
+
+extension RealtimeCausalMambaBlock {
+    fileprivate func step(_ x: MLXArray, state: StreamingCausalMambaBlockState) -> MLXArray {
+        let y = forwardBlocks.step(x, state: state.forward) + x
+        return norm(outputProj(y))
+    }
+}
+
+extension RealtimeTFMambaBlock {
+    fileprivate func step(_ x: MLXArray, state: StreamingTFMambaBlockState) -> MLXArray {
+        let b = x.dim(0)
+        let c = x.dim(1)
+        let f = x.dim(3)
+
+        var xt = x.transposed(0, 3, 2, 1).reshaped(b * f, 1, c)
+        xt = timeMamba.step(xt, state: state.timeMamba) + xt
+        let xTime = xt.reshaped(b, f, 1, c).transposed(0, 3, 2, 1)
+
+        var xf = xTime.transposed(0, 2, 3, 1).reshaped(b, f, c)
+        xf = freqMamba(xf) + xf
+        return xf.reshaped(b, 1, f, c).transposed(0, 3, 1, 2)
+    }
+}
+
 public final class RealtimeStreamingSEMamba {
     public let model: RealtimeSEMamba
-    private var magFrames: MLXArray?
-    private var phaseFrames: MLXArray?
-    private var emittedFrames = 0
+    private let encoder: StreamingDenseEncoder
+    private let magDecoders: [StreamingMagDecoder]
+    private let phaseDecoders: [StreamingPhaseDecoder]
+    private var state: State?
+
+    public final class State {
+        public let batchSize: Int
+        public let freqBins: Int
+        public let encodedFreqBins: Int
+        public let exitLayer: Int
+        public let lookAheadFrames: Int
+        public let dtype: DType
+        fileprivate let encoder: StreamingDenseEncoderState
+        fileprivate let mamba: [StreamingTFMambaBlockState]
+        fileprivate let magDecoder: StreamingMagDecoderState
+        fileprivate let phaseDecoder: StreamingPhaseDecoderState
+        fileprivate var pendingMag: [MLXArray] = []
+        fileprivate var pendingPhase: [MLXArray] = []
+        fileprivate var initialized = false
+
+        fileprivate init(
+            model: RealtimeSEMamba,
+            encoder: StreamingDenseEncoder,
+            magDecoder: StreamingMagDecoder,
+            phaseDecoder: StreamingPhaseDecoder,
+            batchSize: Int,
+            freqBins: Int,
+            exitLayer: Int,
+            lookAheadFrames: Int,
+            dtype: DType
+        ) {
+            self.batchSize = batchSize
+            self.freqBins = freqBins
+            let encoded = freqBins / 2 + 1
+            self.encodedFreqBins = encoded
+            self.exitLayer = exitLayer
+            self.lookAheadFrames = lookAheadFrames
+            self.dtype = dtype
+            self.encoder = encoder.makeState()
+            self.mamba = model.TSMamba.map {
+                StreamingTFMambaBlockState(block: $0, batchSize: batchSize * encoded, dtype: dtype)
+            }
+            self.magDecoder = magDecoder.makeState()
+            self.phaseDecoder = phaseDecoder.makeState()
+        }
+    }
 
     public init(model: RealtimeSEMamba) {
         self.model = model
+        self.encoder = StreamingDenseEncoder(model.denseEncoder)
+        self.magDecoders = model.mask_decoder_list.map { StreamingMagDecoder($0) }
+        self.phaseDecoders = model.phase_decoder_list.map { StreamingPhaseDecoder($0) }
     }
 
     public func reset(batchSize: Int = 1, freqBins: Int) {
-        self.magFrames = nil
-        self.phaseFrames = nil
-        self.emittedFrames = 0
+        reset(batchSize: batchSize, freqBins: freqBins, exitLayer: 8, lookAheadFrames: 0, dtype: model.computeDType)
     }
 
-    /// Stateful streaming API. This keeps the frame history and emits one enhanced
-    /// frame after the configured look-ahead is available. The model work remains on
-    /// MLX/Metal; replacing the history replay with per-layer caches is an internal
-    /// optimization that does not change this public contract.
+    public func reset(batchSize: Int = 1, freqBins: Int, exitLayer: Int, lookAheadFrames: Int, dtype: DType) {
+        precondition((1 ... model.TSMamba.count).contains(exitLayer), "exitLayer must be 1...\(model.TSMamba.count)")
+        precondition((0 ... 2).contains(lookAheadFrames), "lookAheadFrames must be 0...2")
+        self.state = State(
+            model: model,
+            encoder: encoder,
+            magDecoder: magDecoders[exitLayer - 1],
+            phaseDecoder: phaseDecoders[exitLayer - 1],
+            batchSize: batchSize,
+            freqBins: freqBins,
+            exitLayer: exitLayer,
+            lookAheadFrames: lookAheadFrames,
+            dtype: dtype
+        )
+    }
+
+    public func step(noisyMag: MLXArray, noisyPhase: MLXArray) -> (MLXArray, MLXArray)? {
+        guard let state else {
+            preconditionFailure("RealtimeStreamingSEMamba.reset(...) must be called before step(noisyMag:noisyPhase:)")
+        }
+        let magFrame = (noisyMag.ndim == 3 ? noisyMag[0..., 0..., 0] : noisyMag).asType(state.dtype)
+        let phaseFrame = (noisyPhase.ndim == 3 ? noisyPhase[0..., 0..., 0] : noisyPhase).asType(state.dtype)
+
+        if !state.initialized {
+            state.pendingMag.append(magFrame)
+            state.pendingPhase.append(phaseFrame)
+            guard state.pendingMag.count >= state.lookAheadFrames + 1 else {
+                return nil
+            }
+            let magSeq = stacked(state.pendingMag, axis: -1)
+            let phaseSeq = stacked(state.pendingPhase, axis: -1)
+            state.pendingMag.removeAll(keepingCapacity: true)
+            state.pendingPhase.removeAll(keepingCapacity: true)
+            state.initialized = true
+            return process(magSeq: magSeq, phaseSeq: phaseSeq, initial: true, state: state)
+        }
+
+        return process(
+            magSeq: expandedDimensions(magFrame, axis: -1),
+            phaseSeq: expandedDimensions(phaseFrame, axis: -1),
+            initial: false,
+            state: state
+        )
+    }
+
     public func step(
         noisyMag: MLXArray,
         noisyPhase: MLXArray,
         exitLayer: Int = 8,
         lookAheadFrames: Int = 0
     ) -> (MLXArray, MLXArray)? {
-        let magFrame = noisyMag.ndim == 2 ? expandedDimensions(noisyMag, axis: -1) : noisyMag
-        let phaseFrame = noisyPhase.ndim == 2 ? expandedDimensions(noisyPhase, axis: -1) : noisyPhase
-        if let magFrames, let phaseFrames {
-            self.magFrames = concatenated([magFrames, magFrame], axis: -1)
-            self.phaseFrames = concatenated([phaseFrames, phaseFrame], axis: -1)
-        } else {
-            self.magFrames = magFrame
-            self.phaseFrames = phaseFrame
+        let frame = noisyMag.ndim == 3 ? noisyMag[0..., 0..., 0] : noisyMag
+        if state == nil ||
+            state!.batchSize != frame.dim(0) ||
+            state!.freqBins != frame.dim(1) ||
+            state!.exitLayer != exitLayer ||
+            state!.lookAheadFrames != lookAheadFrames ||
+            state!.dtype != model.computeDType {
+            reset(batchSize: frame.dim(0), freqBins: frame.dim(1), exitLayer: exitLayer, lookAheadFrames: lookAheadFrames, dtype: model.computeDType)
         }
-
-        guard let allMag = self.magFrames, let allPhase = self.phaseFrames else {
-            return nil
-        }
-        let available = allMag.dim(-1)
-        guard available > lookAheadFrames, emittedFrames < available - lookAheadFrames else {
-            return nil
-        }
-
-        let (magOut, phaseOut, _) = model(noisyMag: allMag, noisyPhase: allPhase, exitLayer: exitLayer, lookAheadFrames: lookAheadFrames)
-        let idx = emittedFrames
-        emittedFrames += 1
-        return (magOut[0..., 0..., idx], phaseOut[0..., 0..., idx])
+        return step(noisyMag: noisyMag, noisyPhase: noisyPhase)
     }
 
     public func flush(exitLayer: Int = 8, lookAheadFrames: Int = 0) -> [(MLXArray, MLXArray)] {
-        guard lookAheadFrames > 0, let allMag = self.magFrames, let allPhase = self.phaseFrames else {
+        guard let state, state.lookAheadFrames > 0 else {
             return []
         }
-        let pad = MLXArray.zeros([allMag.dim(0), allMag.dim(1), lookAheadFrames], dtype: allMag.dtype)
-        self.magFrames = concatenated([allMag, pad], axis: -1)
-        self.phaseFrames = concatenated([allPhase, pad], axis: -1)
         var out: [(MLXArray, MLXArray)] = []
-        while let magFrames = self.magFrames, emittedFrames < magFrames.dim(-1) - lookAheadFrames {
-            let (magOut, phaseOut, _) = model(noisyMag: magFrames, noisyPhase: self.phaseFrames!, exitLayer: exitLayer, lookAheadFrames: lookAheadFrames)
-            let idx = emittedFrames
-            emittedFrames += 1
-            out.append((magOut[0..., 0..., idx], phaseOut[0..., 0..., idx]))
+        for _ in 0 ..< state.lookAheadFrames {
+            let zero = MLXArray.zeros([state.batchSize, state.freqBins], dtype: state.dtype)
+            if let frame = step(noisyMag: zero, noisyPhase: zero) {
+                out.append(frame)
+            }
         }
         return out
+    }
+
+    private func process(magSeq: MLXArray, phaseSeq: MLXArray, initial: Bool, state: State) -> (MLXArray, MLXArray) {
+        let mag = expandedDimensions(magSeq.transposed(0, 2, 1), axis: 1)
+        let pha = expandedDimensions(phaseSeq.transposed(0, 2, 1), axis: 1)
+        var x = concatenated([mag, pha], axis: 1)
+        x = concatenated([x, MLXArray.zeros([x.dim(0), x.dim(1), x.dim(2), 2], dtype: x.dtype)], axis: -1)
+
+        x = encoder.step(x, state: state.encoder, lookAheadFrames: state.lookAheadFrames, initial: initial)
+        for i in 0 ..< state.exitLayer {
+            x = model.TSMamba[i].step(x, state: state.mamba[i])
+        }
+
+        let magOut = magDecoders[state.exitLayer - 1].step(x, state: state.magDecoder, outputFreqBins: state.freqBins).asType(.float32)
+        let phaseOut = phaseDecoders[state.exitLayer - 1].step(x, state: state.phaseDecoder, outputFreqBins: state.freqBins).asType(.float32)
+        return (magOut, phaseOut)
     }
 }

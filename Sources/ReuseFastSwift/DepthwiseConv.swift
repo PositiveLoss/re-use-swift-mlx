@@ -86,4 +86,26 @@ public enum FusedDepthwiseConv {
             outputDTypes: [x.dtype]
         )[0]
     }
+
+    /// One-token causal depthwise conv. `x` is `[B, C]`, `cache` is `[B, K-1, C]`
+    /// ordered oldest-to-newest, and `weight` is `[C, K]`.
+    public static func step(
+        x: MLXArray,
+        cache: MLXArray,
+        weight: MLXArray,
+        bias: MLXArray,
+        applySilu: Bool
+    ) -> (MLXArray, MLXArray) {
+        let k = weight.shape[1]
+        precondition(cache.shape[1] == k - 1, "cache length must be K-1")
+        let x1 = expandedDimensions(x, axis: 1)
+        let window = concatenated([cache, x1], axis: 1)
+        let weighted = window * weight.T.reshaped(1, k, weight.shape[0])
+        var y = weighted.sum(axis: 1) + bias.reshaped(1, -1)
+        if applySilu {
+            y = y / (1 + exp(-y))
+        }
+        let newCache = window[0..., 1 ..< k, 0...]
+        return (y, newCache)
+    }
 }

@@ -284,6 +284,16 @@ public final class DepthwiseCausalConv1d: Module {
     }
 }
 
+public final class MambaSSMState {
+    public var convCache: MLXArray
+    public var ssmState: MLXArray
+
+    public init(batchSize: Int, dInner: Int, dConv: Int, dState: Int, dtype: DType) {
+        self.convCache = MLXArray.zeros([batchSize, dConv - 1, dInner], dtype: dtype)
+        self.ssmState = MLXArray.zeros([batchSize, dInner, dState], dtype: .float32)
+    }
+}
+
 public final class MambaSSM: Module {
     public let dModel: Int
     public let dState: Int
@@ -356,6 +366,48 @@ public final class MambaSSM: Module {
             )
         }
         return ReuseProfiler.measure("out_proj") { outProj(y) }
+    }
+
+    /// One-token cached inference. `x` is `[B, 1, dModel]`.
+    public func step(_ x: MLXArray, state: MambaSSMState) -> MLXArray {
+        let token = x[0..., 0, 0...]
+        let xz = inProj(token)
+        let parts = xz.split(parts: 2, axis: -1)
+        let xIn = parts[0]
+        let z = parts[1]
+
+        let (xConv, newConvCache) = FusedDepthwiseConv.step(
+            x: xIn,
+            cache: state.convCache,
+            weight: conv1d.weight.reshaped(dInner, dConv),
+            bias: conv1d.bias,
+            applySilu: true
+        )
+        state.convCache = newConvCache
+
+        let splitBC = xProj(xConv)
+        let bc = MLX.split(splitBC, indices: [dtRank, dtRank + dState], axis: -1)
+        let dt = bc[0]
+        let Bvar = bc[1]
+        let Cvar = bc[2]
+        let delta = dt.matmul(dtProj.weight.T)
+        let A = -exp(ALog.asType(.float32))
+
+        let (y, newSSMState) = ReuseSelectiveScan.step(
+            u: xConv,
+            delta: delta,
+            A: A,
+            Bvar: Bvar,
+            Cvar: Cvar,
+            D: D,
+            z: z,
+            deltaBias: dtProj.bias,
+            state: state.ssmState,
+            deltaSoftplus: true,
+            outputDType: .float32
+        )
+        state.ssmState = newSSMState
+        return outProj(expandedDimensions(y.asType(x.dtype), axis: 1))
     }
 }
 
