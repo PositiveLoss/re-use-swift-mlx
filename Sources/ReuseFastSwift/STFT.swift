@@ -185,6 +185,19 @@ private func overlapAdd(frames: MLXArray, hop: Int, outLen: Int) -> MLXArray {
     return MLXArray(outData, [b, outLen])
 }
 
+private func overlapAddWindowEnvelope(window: MLXArray, nFrames: Int, hop: Int, outLen: Int) -> MLXArray {
+    eval(window)
+    let w = window.asArray(Float.self)
+    var out = [Float](repeating: 0.0, count: outLen)
+    for i in 0 ..< nFrames {
+        let outOffset = i * hop
+        for j in 0 ..< w.count {
+            out[outOffset + j] += w[j] * w[j]
+        }
+    }
+    return MLXArray(out, [1, outLen])
+}
+
 /// Inverse STFT for RE-USE. Inputs are magnitude/phase `[B,F,T]`.
 public func magPhaseISTFT(
     mag inputMag: MLXArray,
@@ -210,15 +223,11 @@ public func magPhaseISTFT(
     let window = windowForFFT(nFFT: nFFT, win: win)
     frames = frames * window.reshaped(1, 1, -1)
 
-    // Calculate NOLA (Non-Zero Overlap Add) normalization factor for Hann window
-    // PyTorch's istft divides by the sum of squared windows.
-    // For a Hann window, the sum of shifted squares is exactly (win / hop) * 0.375
-    let windowSqSum = Float(win) / Float(hop) * 0.375
-
     let nFrames = frames.dim(1)
     let outLen = nFFT + hop * (nFrames - 1)
     var signal = overlapAdd(frames: frames, hop: hop, outLen: outLen)
-    signal = signal / windowSqSum
+    let envelope = overlapAddWindowEnvelope(window: window, nFrames: nFrames, hop: hop, outLen: outLen)
+    signal = signal / maximum(envelope, stftEPS)
 
     if center {
         let pad = nFFT / 2
